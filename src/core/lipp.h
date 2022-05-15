@@ -56,7 +56,7 @@ class LIPP
         return 5;
     }
 
-    struct Node;
+    struct Node : public OptLock ;
     inline int PREDICT_POS(Node* node, T key) const {
         double v = node->model.predict_double(key);
         if (v > std::numeric_limits<int>::max() / 2) {
@@ -118,7 +118,7 @@ public:
         }
 
         uint32_t getLocalEpoch() const {
-            return mLocalEpoch.load(std::memory_order_acquire);
+            return mLocalEpoch.load(std::memory_order_acquire);zx
         }
 
         void enter(uint32_t newEpoch) {
@@ -255,22 +255,67 @@ public:
         root = insert_tree(root, key, value);
     }
     P at(const T& key, bool skip_existence_check = true) const {
+        //int restartCount = 0;
+        restart:
+        //if (restartCount++)
+        //    yield(restartCount);
+        bool needRestart = false;
+
         EpochGuard guard; // epoch memory reclaimation
         Node* node = root;
 
+        //lock
+        uint64_t version = node->readLockOrRestart(needRestart) ;
+        if(needRestart || (node!=root)) goto restart ;
+
+        Node* parent = nullptr ;
+        uint64_t versionParent ;
+
         while (true) {
-            int pos = PREDICT_POS(node, key);
+            int pos = PREDICT_POS(node, key) ; 
+            Node* inner = node ;
+
+            if(parent){
+                parent->readUnlockOrRestart(versionParent, needRestart);
+	            if (needRestart) goto restart;
+            }
+
+            parent = inner ;
+            versionParent = version ;
+
             if (BITMAP_GET(node->child_bitmap, pos) == 1) {
-                node = node->items[pos].comp.child;
+                node = inner->items[pos].comp.child ;
+
+                inner->checkOrRestart(version, needRestart) ;
+                if(needRestart) goto restart ;
+                version = node->readLockOrRestart(needRestart) ;
+                if(needRestart) goto restart ;
             } else {
                 if (skip_existence_check) {
-                    return node->items[pos].comp.data.value;
+                    P value = node->items[pos].comp.data.value ;
+
+                    //unlock
+                    node->readUnlockOrRestart(version, needRestart) ;
+                    if(needRestart) goto restart ;
+
+                    return value ;
                 } else {
                     if (BITMAP_GET(node->none_bitmap, pos) == 1) {
+                        //unlock
+                        node->readUnlockOrRestart(version, needRestart) ;
+                        if(needRestart) goto restart ;
+
                         RT_ASSERT(false);
                     } else if (BITMAP_GET(node->child_bitmap, pos) == 0) {
-                        RT_ASSERT(node->items[pos].comp.data.key == key);
-                        return node->items[pos].comp.data.value;
+                        P value = node->items[pos].comp.data.value ;
+                        T kkey = node->items[pos].comp.data.key ;
+
+                        //unlock
+                        node->readUnlockOrRestart(version, needRestart) ;
+                        if(needRestart) goto restart ;
+
+                        RT_ASSERT( kkey == key);
+                        return value ;
                     }
                 }
             }
@@ -943,32 +988,67 @@ private:
 
     Node* insert_tree(Node* _node, const T& key, const P& value)
     {
+        restart :
+
+        bool needRestart = false;
+
+        //lock
+        uint64_t version = _node->readLockOrRestart(needRestart) ;
+        if(needRestart) goto restart ;
+
+        //do we need parent???
+        Node* parent = nullptr ;
+        uint64_t versionParent ;
+        
         constexpr int MAX_DEPTH = 128;
         Node* path[MAX_DEPTH];
         int path_size = 0;
         int insert_to_data = 0;
 
         for (Node* node = _node; ; ) {
+            Node* inner = node ;
+
+            // ?? need to unlock if pathsize >= MAX_DEPTH
             RT_ASSERT(path_size < MAX_DEPTH);
             path[path_size ++] = node;
 
             node->size ++;
             node->num_inserts ++;
             int pos = PREDICT_POS(node, key);
+
             if (BITMAP_GET(node->none_bitmap, pos) == 1) {
+                //upgrade to write lock
+                node->upgradeToWriteLockOrRestart(version, needRestart) ;
+                if(needRestart) goto restart ;
+
                 BITMAP_CLEAR(node->none_bitmap, pos);
                 node->items[pos].comp.data.key = key;
                 node->items[pos].comp.data.value = value;
+
                 break;
             } else if (BITMAP_GET(node->child_bitmap, pos) == 0) {
+                //upgrade to write lock
+                node->upgradeToWriteLockOrRestart(version, needRestart) ;
+                if(needRestart) goto restart ;
+
                 BITMAP_SET(node->child_bitmap, pos);
                 node->items[pos].comp.child = build_tree_two(key, value, node->items[pos].comp.data.key, node->items[pos].comp.data.value);
                 insert_to_data = 1;
+
                 break;
             } else {
                 node = node->items[pos].comp.child;
+
+                inner->checkOrRestart(version, needRestart) ;
+                if(needRestart) goto restart ;
+                version = node->readLockOrRestart(needRestart) ;
+                if(needRestart) goto restart ;
             }
         }
+
+
+        //need to continue??!!
+
         for (int i = 0; i < path_size; i ++) {
             path[i]->num_insert_to_data += insert_to_data;
         }
