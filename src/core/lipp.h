@@ -56,7 +56,7 @@ class LIPP
         return 5;
     }
 
-    struct Node : public OptLock ;
+    struct Node ;
     inline int PREDICT_POS(Node* node, T key) const {
         double v = node->model.predict_double(key);
         if (v > std::numeric_limits<int>::max() / 2) {
@@ -496,7 +496,7 @@ private:
             Node* child;
         } comp;
     };
-    struct Node
+    struct Node : public OptLock
     {
         int is_two; // is special node for only two keys
         int build_size; // tree size (include sub nodes) when node created
@@ -992,26 +992,21 @@ private:
         restart:
         if (restartCount++)
             yield(restartCount);
-
-        bool needRestart = false ;
+        bool needRestart = false;
 
         //lock
-        uint64_t version = _node->readLockOrRestart(needRestart) ;
-        if(needRestart) goto restart ;
+        uint64_t version = node->readLockOrRestart(needRestart) ;
+        if(needRestart || (node!=root)) goto restart ;
 
-        //do we need parent???
         Node* parent = nullptr ;
         uint64_t versionParent ;
-        
+
         constexpr int MAX_DEPTH = 128;
         Node* path[MAX_DEPTH];
         int path_size = 0;
         int insert_to_data = 0;
 
         for (Node* node = _node; ; ) {
-            Node* inner = node ;
-
-            // ?? need to unlock if pathsize >= MAX_DEPTH
             RT_ASSERT(path_size < MAX_DEPTH);
             path[path_size ++] = node;
 
@@ -1019,37 +1014,57 @@ private:
             node->num_inserts ++;
             int pos = PREDICT_POS(node, key);
 
+            Node* inner = node ;
+
+            if (parent){
+                parent->readUnlockOrRestart(versionParent, needRestart);
+                if (needRestart) goto restart;
+            }
+
             if (BITMAP_GET(node->none_bitmap, pos) == 1) {
+                node->upgradeToWriteLockOrRestart(version, needRestart);
+                if(needRestart) goto restart ;
+
                 BITMAP_CLEAR(node->none_bitmap, pos);
                 node->items[pos].comp.data.key = key;
                 node->items[pos].comp.data.value = value;
+                
+                node->writeUnlock() ;
 
                 break;
             } else if (BITMAP_GET(node->child_bitmap, pos) == 0) {
+                node->upgradeToWriteLockOrRestart(version, needRestart);
+                if(needRestart) goto restart ;
+
                 BITMAP_SET(node->child_bitmap, pos);
                 node->items[pos].comp.child = build_tree_two(key, value, node->items[pos].comp.data.key, node->items[pos].comp.data.value);
                 insert_to_data = 1;
+
+                node->writeUnlock() ;
+
                 break;
             } else {
+                parent = inner;
+                versionParent = version;
+
                 node = node->items[pos].comp.child;
 
-                node->writeLockOrRestart(needRestart) ;
-                if(needRestart){
-                    for(int j = 0 ; j < path_size ; j ++){
-                        path[j]->writeUnlock() ;
-                    }
-                    goto restart ;
-                }
+                inner->checkOrRestart(version, needRestart);
+                if (needRestart) goto restart;
+                versionNode = node->readLockOrRestart(needRestart);
+                if (needRestart) goto restart;
             }
         }
 
-        for (int i = 0; i < path_size; i ++) {
-           
-            path[i]->num_insert_to_data += insert_to_data;
 
+        for (int i = 0; i < path_size; i ++) {
+            atomic_add(path[i]->num_insert_to_data, insert_to_data) ;
+        }
+
+        for (int i = 0; i < path_size; i ++) {
             Node* node = path[i];
             const int num_inserts = node->num_inserts;
-            const int num_insert_to_data = node->num_insert_to_data ;
+            const int num_insert_to_data = node->num_insert_to_data;
             const bool need_rebuild = node->fixed == 0 && node->size >= node->build_size * 4 && node->size >= 64 && num_insert_to_data * 10 >= num_inserts;
 
             if (need_rebuild) {
@@ -1087,8 +1102,6 @@ private:
                 }
 
                 break;
-            }else{
-                path[i]->writeUnlock() ;
             }
         }
 
