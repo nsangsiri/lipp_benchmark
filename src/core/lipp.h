@@ -255,10 +255,10 @@ public:
         root = insert_tree(root, key, value);
     }
     P at(const T& key, bool skip_existence_check = true) const {
-        //int restartCount = 0;
+        int restartCount = 0;
         restart:
-        //if (restartCount++)
-        //    yield(restartCount);
+        if (restartCount++)
+            yield(restartCount);
         bool needRestart = false;
 
         EpochGuard guard; // epoch memory reclaimation
@@ -988,9 +988,12 @@ private:
 
     Node* insert_tree(Node* _node, const T& key, const P& value)
     {
-        restart :
+        int restartCount = 0;
+        restart:
+        if (restartCount++)
+            yield(restartCount);
 
-        bool needRestart = false;
+        bool needRestart = false ;
 
         //lock
         uint64_t version = _node->readLockOrRestart(needRestart) ;
@@ -1017,46 +1020,36 @@ private:
             int pos = PREDICT_POS(node, key);
 
             if (BITMAP_GET(node->none_bitmap, pos) == 1) {
-                //upgrade to write lock
-                node->upgradeToWriteLockOrRestart(version, needRestart) ;
-                if(needRestart) goto restart ;
-
                 BITMAP_CLEAR(node->none_bitmap, pos);
                 node->items[pos].comp.data.key = key;
                 node->items[pos].comp.data.value = value;
 
                 break;
             } else if (BITMAP_GET(node->child_bitmap, pos) == 0) {
-                //upgrade to write lock
-                node->upgradeToWriteLockOrRestart(version, needRestart) ;
-                if(needRestart) goto restart ;
-
                 BITMAP_SET(node->child_bitmap, pos);
                 node->items[pos].comp.child = build_tree_two(key, value, node->items[pos].comp.data.key, node->items[pos].comp.data.value);
                 insert_to_data = 1;
-
                 break;
             } else {
                 node = node->items[pos].comp.child;
 
-                inner->checkOrRestart(version, needRestart) ;
-                if(needRestart) goto restart ;
-                version = node->readLockOrRestart(needRestart) ;
-                if(needRestart) goto restart ;
+                node->writeLockOrRestart(needRestart) ;
+                if(needRestart){
+                    for(int j = 0 ; j < path_size ; j ++){
+                        path[j]->writeUnlock() ;
+                    }
+                    goto restart ;
+                }
             }
         }
 
-
-        //need to continue??!!
-
         for (int i = 0; i < path_size; i ++) {
+           
             path[i]->num_insert_to_data += insert_to_data;
-        }
 
-        for (int i = 0; i < path_size; i ++) {
             Node* node = path[i];
             const int num_inserts = node->num_inserts;
-            const int num_insert_to_data = node->num_insert_to_data;
+            const int num_insert_to_data = node->num_insert_to_data ;
             const bool need_rebuild = node->fixed == 0 && node->size >= node->build_size * 4 && node->size >= 64 && num_insert_to_data * 10 >= num_inserts;
 
             if (need_rebuild) {
@@ -1094,6 +1087,8 @@ private:
                 }
 
                 break;
+            }else{
+                path[i]->writeUnlock() ;
             }
         }
 
