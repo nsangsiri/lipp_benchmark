@@ -255,6 +255,8 @@ public:
         root = insert_tree(root, key, value);
     }
     P at(const T& key, bool skip_existence_check = true) const {
+
+        EpochGuard guard ;
         //printf("At key - %d\n", key);
         int restartCount = 0;
         restart:
@@ -262,7 +264,7 @@ public:
             yield(restartCount);
         bool needRestart = false;
 
-        EpochGuard guard; // epoch memory reclaimation
+         // epoch memory reclaimation
         Node* node = root;
 
         (guard->instance)->scheduleForDeletion(dfsvsdvd) ;
@@ -553,6 +555,11 @@ private:
     void delete_nodes(Node* p, int n)
     {
         node_allocator.deallocate(p, n);
+    }
+
+    void delete_oneNodes(Node* p)
+    {
+        node_allocator.deallocate(p, 1);
     }
 
     std::allocator<Item> item_allocator;
@@ -971,8 +978,33 @@ private:
         }
     }
 
+    void delete_all(void *vnode){
+        Node *node = (node*)vnode ;
+
+        delete_items(node->items, node->num_items);
+        const int bitmap_size = BITMAP_SIZE(node->num_items);
+        delete_bitmap(node->none_bitmap, bitmap_size);
+        delete_bitmap(node->child_bitmap, bitmap_size);
+        delete_nodes(node, 1);
+    }
+
+    void delete_two(void*vnode){
+        Node *node = (node*)vnode ;
+        node->size = 2;
+        node->num_inserts = node->num_insert_to_data = 0;
+        node->none_bitmap[0] = 0xff;
+        node->child_bitmap[0] = 0;
+        pending_two.push(node);
+    }
+
     void scan_and_destory_tree(Node* _root, T* keys, P* values, bool destory = true)
     {
+        int restartCount = 0;
+        restart:
+        if (restartCount++)
+            yield(restartCount);
+        bool needRestart = false;
+
         typedef std::pair<int, Node*> Segment; // <begin, Node*>
         std::stack<Segment> s;
 
@@ -982,6 +1014,11 @@ private:
             Node* node = s.top().second;
             const int SHOULD_END_POS = begin + node->size;
             s.pop();
+
+            if(node != _root){
+                uint64_t version = node->readLockOrRestart(needRestart) ;
+                if(needRestart) goto restart ;
+            }
 
             for (int i = 0; i < node->num_items; i ++) {
                 if (BITMAP_GET(node->none_bitmap, i) == 0) {
@@ -1001,21 +1038,83 @@ private:
                 if (node->is_two) {
                     RT_ASSERT(node->build_size == 2);
                     RT_ASSERT(node->num_items == 8);
-                    node->size = 2;
-                    node->num_inserts = node->num_insert_to_data = 0;
-                    node->none_bitmap[0] = 0xff;
-                    node->child_bitmap[0] = 0;
-                    pending_two.push(node);
+                    ebr->scheduleForDeletion(std::make_pair((void *)node, delete_two)) ;
                 } else {
-                    delete_items(node->items, node->num_items);
-                    const int bitmap_size = BITMAP_SIZE(node->num_items);
-                    delete_bitmap(node->none_bitmap, bitmap_size);
-                    delete_bitmap(node->child_bitmap, bitmap_size);
-                    delete_nodes(node, 1);
-
+                    ebr->scheduleForDeletion(std::make_pair((void *)node, delete_nodes)) ;
                 }
             }
+
+            if(node != _root){
+                node->readUnlockOrRestart(needRestart) ;
+                if(needRestart) goto restart ;
+            }
         }
+    }
+
+    void adjust(Node* path, int path_size){
+        int restartCount = 0;
+        restart:
+        if (restartCount++)
+            yield(restartCount);
+        bool needRestart = false;
+
+        for (int i = 0; i < path_size; i ++) {
+            Node* node = path[i];
+
+            uint64_t version = node->readLockOrRestart(needRestart) ;
+            if(needRestart) goto restart ;
+
+            const int num_inserts = node->num_inserts ;
+            const int num_insert_to_data = node->num_insert_to_data ;
+            const bool need_rebuild = node->fixed == 0 && node->size >= node->build_size * 4 && node->size >= 64 && num_insert_to_data * 10 >= num_inserts;
+
+            if (!need_rebuild){
+                node->readUnlockOrRestart(needRestart) ;
+                if(needRestart) goto restart ;
+            }
+            else {
+                node->upgradeToWriteLockOrRestart(needRestart) ;
+                if(needRestart) goto restart ;
+
+                const int ESIZE = node->size;
+                T* keys = new T[ESIZE] ;
+                P* values = new P[ESIZE] ;
+
+                #if COLLECT_TIME
+                auto start_time_scan = std::chrono::high_resolution_clock::now();
+                #endif
+                scan_and_destory_tree(node, keys, values);
+                #if COLLECT_TIME
+                auto end_time_scan = std::chrono::high_resolution_clock::now();
+                auto duration_scan = end_time_scan - start_time_scan;
+                stats.time_scan_and_destory_tree += std::chrono::duration_cast<std::chrono::nanoseconds>(duration_scan).count() * 1e-9;
+                #endif
+
+                #if COLLECT_TIME
+                auto start_time_build = std::chrono::high_resolution_clock::now();
+                #endif
+                Node* new_node = build_tree_bulk(keys, values, ESIZE);
+                #if COLLECT_TIME
+                auto end_time_build = std::chrono::high_resolution_clock::now();
+                auto duration_build = end_time_build - start_time_build;
+                stats.time_build_tree_bulk += std::chrono::duration_cast<std::chrono::nanoseconds>(duration_build).count() * 1e-9;
+                #endif
+
+                delete[] keys;
+                delete[] values;
+
+                path[i] = new_node;
+                if (i > 0) {
+                    int pos = PREDICT_POS(path[i-1], key);
+                    path[i-1]->items[pos].comp.child = new_node;
+                }
+
+                //no need for unlock bc it was delete. the new node isnt locked.
+
+                break;
+            }
+        }
+
     }
 
     Node* insert_tree(Node* _node, const T& key, const P& value)
@@ -1108,54 +1207,11 @@ private:
             }
         }
 
-
         for (int i = 0; i < path_size; i ++) {
             atomic_add(path[i]->num_insert_to_data, insert_to_data) ;
         }
 
-        for (int i = 0; i < path_size; i ++) {
-            Node* node = path[i];
-            const int num_inserts = node->num_inserts;
-            const int num_insert_to_data = node->num_insert_to_data;
-            const bool need_rebuild = node->fixed == 0 && node->size >= node->build_size * 4 && node->size >= 64 && num_insert_to_data * 10 >= num_inserts;
-
-            if (need_rebuild) {
-                const int ESIZE = node->size;
-                T* keys = new T[ESIZE];
-                P* values = new P[ESIZE];
-
-                #if COLLECT_TIME
-                auto start_time_scan = std::chrono::high_resolution_clock::now();
-                #endif
-                scan_and_destory_tree(node, keys, values);
-                #if COLLECT_TIME
-                auto end_time_scan = std::chrono::high_resolution_clock::now();
-                auto duration_scan = end_time_scan - start_time_scan;
-                stats.time_scan_and_destory_tree += std::chrono::duration_cast<std::chrono::nanoseconds>(duration_scan).count() * 1e-9;
-                #endif
-
-                #if COLLECT_TIME
-                auto start_time_build = std::chrono::high_resolution_clock::now();
-                #endif
-                Node* new_node = build_tree_bulk(keys, values, ESIZE);
-                #if COLLECT_TIME
-                auto end_time_build = std::chrono::high_resolution_clock::now();
-                auto duration_build = end_time_build - start_time_build;
-                stats.time_build_tree_bulk += std::chrono::duration_cast<std::chrono::nanoseconds>(duration_build).count() * 1e-9;
-                #endif
-
-                delete[] keys;
-                delete[] values;
-
-                path[i] = new_node;
-                if (i > 0) {
-                    int pos = PREDICT_POS(path[i-1], key);
-                    path[i-1]->items[pos].comp.child = new_node;
-                }
-
-                break;
-            }
-        }
+        adjust(path, path_size) ;
 
         return path[0];
     }
