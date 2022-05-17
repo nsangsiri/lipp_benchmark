@@ -118,7 +118,7 @@ public:
         }
 
         uint32_t getLocalEpoch() const {
-            return mLocalEpoch.load(std::memory_order_acquire);zx
+            return mLocalEpoch.load(std::memory_order_acquire);
         }
 
         void enter(uint32_t newEpoch) {
@@ -255,6 +255,7 @@ public:
         root = insert_tree(root, key, value);
     }
     P at(const T& key, bool skip_existence_check = true) const {
+        //printf("At key - %d\n", key);
         int restartCount = 0;
         restart:
         if (restartCount++)
@@ -264,9 +265,14 @@ public:
         EpochGuard guard; // epoch memory reclaimation
         Node* node = root;
 
+        (guard->instance)->scheduleForDeletion(dfsvsdvd) ;
+
         //lock
         uint64_t version = node->readLockOrRestart(needRestart) ;
-        if(needRestart || (node!=root)) goto restart ;
+        if(needRestart || (node!=root)) {
+            //printf("1At key - %d\n", key);
+            goto restart ;
+            }
 
         Node* parent = nullptr ;
         uint64_t versionParent ;
@@ -277,7 +283,10 @@ public:
 
             if(parent){
                 parent->readUnlockOrRestart(versionParent, needRestart);
-	            if (needRestart) goto restart;
+	            if (needRestart) {
+                    //printf("2At key - %d\n", key);
+                    goto restart;
+                }
             }
 
             parent = inner ;
@@ -285,25 +294,40 @@ public:
 
             if (BITMAP_GET(node->child_bitmap, pos) == 1) {
                 node = inner->items[pos].comp.child ;
-
+                //std::cout << node->get_version_number() << std::endl;
                 inner->checkOrRestart(version, needRestart) ;
-                if(needRestart) goto restart ;
+                if(needRestart) {
+                    //printf("3At key - %d\n", key);
+                    goto restart;
+                }
                 version = node->readLockOrRestart(needRestart) ;
-                if(needRestart) goto restart ;
+                if(needRestart) {
+                    // std::cout << "Version " << node->get_version_number() << " in key " << key << "\n";
+                    // std::cout << node->isObsolete() << " " << node->isLocked() << "\n"; 
+                    //printf("4At key - %d, %d\n", key, &node);
+                    goto restart;
+                }
+                //printf("************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************\n\n") ;
             } else {
                 if (skip_existence_check) {
                     P value = node->items[pos].comp.data.value ;
 
                     //unlock
                     node->readUnlockOrRestart(version, needRestart) ;
-                    if(needRestart) goto restart ;
+                    if(needRestart) {
+                    //printf("5At key - %d\n", key);
+                    goto restart;
+                }
 
                     return value ;
                 } else {
                     if (BITMAP_GET(node->none_bitmap, pos) == 1) {
                         //unlock
                         node->readUnlockOrRestart(version, needRestart) ;
-                        if(needRestart) goto restart ;
+                        if(needRestart){
+                            //printf("6At key - %d\n", key);
+                            goto restart;
+                        }
 
                         RT_ASSERT(false);
                     } else if (BITMAP_GET(node->child_bitmap, pos) == 0) {
@@ -312,7 +336,10 @@ public:
 
                         //unlock
                         node->readUnlockOrRestart(version, needRestart) ;
-                        if(needRestart) goto restart ;
+                        if(needRestart){
+                            //printf("7At key - %d\n", key);
+                            goto restart;
+                        }
 
                         RT_ASSERT( kkey == key);
                         return value ;
@@ -502,7 +529,8 @@ private:
         int build_size; // tree size (include sub nodes) when node created
         int size; // current tree size (include sub nodes)
         int fixed; // fixed node will not trigger rebuild
-        int num_inserts, num_insert_to_data;
+        int num_inserts;
+        std::atomic<int> num_insert_to_data;
         int num_items; // size of items
         LinearModel<T> model;
         Item* items;
@@ -517,6 +545,8 @@ private:
     Node* new_nodes(int n)
     {
         Node* p = node_allocator.allocate(n);
+        p->typeVersionLockObsolete = 0b100;
+
         RT_ASSERT(p != NULL && p != (Node*)(-1));
         return p;
     }
@@ -566,7 +596,7 @@ private:
         BITMAP_SET(node->none_bitmap, 0);
         node->child_bitmap = new_bitmap(1);
         node->child_bitmap[0] = 0;
-
+        node->typeVersionLockObsolete = 0b100;
         return node;
     }
     /// build a tree with two keys
@@ -597,6 +627,7 @@ private:
         } else {
             node = pending_two.top(); pending_two.pop();
         }
+        node->typeVersionLockObsolete = 0b100;
 
         const long double mid1_key = key1;
         const long double mid2_key = key2;
@@ -981,6 +1012,7 @@ private:
                     delete_bitmap(node->none_bitmap, bitmap_size);
                     delete_bitmap(node->child_bitmap, bitmap_size);
                     delete_nodes(node, 1);
+
                 }
             }
         }
@@ -988,6 +1020,7 @@ private:
 
     Node* insert_tree(Node* _node, const T& key, const P& value)
     {
+        //printf("Insert key - %d, value - %d \n", key, value);
         int restartCount = 0;
         restart:
         if (restartCount++)
@@ -995,8 +1028,11 @@ private:
         bool needRestart = false;
 
         //lock
-        uint64_t version = node->readLockOrRestart(needRestart) ;
-        if(needRestart || (node!=root)) goto restart ;
+        uint64_t version = _node->readLockOrRestart(needRestart) ;
+        if(needRestart) {  
+                    //printf("1At key - %d, %d\n", key, value);
+                    goto restart;
+                }
 
         Node* parent = nullptr ;
         uint64_t versionParent ;
@@ -1010,20 +1046,27 @@ private:
             RT_ASSERT(path_size < MAX_DEPTH);
             path[path_size ++] = node;
 
+            if (parent){
+                parent->readUnlockOrRestart(versionParent, needRestart);
+                if (needRestart) {
+                    //printf("2At key - %d, %d\n", key, &node);
+                    goto restart;
+                }
+            }
+
             node->size ++;
             node->num_inserts ++;
             int pos = PREDICT_POS(node, key);
 
             Node* inner = node ;
 
-            if (parent){
-                parent->readUnlockOrRestart(versionParent, needRestart);
-                if (needRestart) goto restart;
-            }
 
             if (BITMAP_GET(node->none_bitmap, pos) == 1) {
                 node->upgradeToWriteLockOrRestart(version, needRestart);
-                if(needRestart) goto restart ;
+                if(needRestart) {
+                    //printf("3At key - %d, %d\n", key, &node);
+                    goto restart;
+                }
 
                 BITMAP_CLEAR(node->none_bitmap, pos);
                 node->items[pos].comp.data.key = key;
@@ -1034,7 +1077,10 @@ private:
                 break;
             } else if (BITMAP_GET(node->child_bitmap, pos) == 0) {
                 node->upgradeToWriteLockOrRestart(version, needRestart);
-                if(needRestart) goto restart ;
+                if(needRestart){
+                    //printf("4At key - %d, %d\n", key, &node);
+                    goto restart;
+                }
 
                 BITMAP_SET(node->child_bitmap, pos);
                 node->items[pos].comp.child = build_tree_two(key, value, node->items[pos].comp.data.key, node->items[pos].comp.data.value);
@@ -1050,9 +1096,15 @@ private:
                 node = node->items[pos].comp.child;
 
                 inner->checkOrRestart(version, needRestart);
-                if (needRestart) goto restart;
-                versionNode = node->readLockOrRestart(needRestart);
-                if (needRestart) goto restart;
+                if (needRestart) {
+                    //printf("5At key - %d, %d\n", key, &node);
+                    goto restart;
+                }
+                version = node->readLockOrRestart(needRestart);
+                if (needRestart) {
+                    //printf("6At key - %d, %d\n", key, &node);
+                    goto restart;
+                }
             }
         }
 

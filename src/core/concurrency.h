@@ -100,6 +100,7 @@
     void upgradeToWriteLockOrRestart(uint64_t &version, bool &needRestart) {
       if (typeVersionLockObsolete.compare_exchange_strong(version, version + 0b10)) {
         version = version + 0b10;
+        //std::cout << "Locking version " << version << std::endl;
       } else {
         _mm_pause();
         needRestart = true;
@@ -107,6 +108,7 @@
     }
 
     void writeUnlock() {
+        //std::cout << "UnLocking\n";
       typeVersionLockObsolete.fetch_add(0b10);
     }
 
@@ -130,10 +132,12 @@
     }
 
     void writeUnlockObsolete() {
+        //std::cout << "Unlocking obsolete\n";
       typeVersionLockObsolete.fetch_add(0b11);
     }
 
     void labelObsolete() {
+        //std::cout << "Locking obsolete\n";
       typeVersionLockObsolete.store((typeVersionLockObsolete.load() | 1));
     }
 
