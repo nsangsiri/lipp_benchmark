@@ -198,10 +198,10 @@ public:
 
                 if (op == READ) {  // get
                     PAYLOAD_TYPE val = index.at(key, false);
-                    // if(val != key) {
-                    //     printf("read failed, Key %lu, val %llu\n",key, val);
-                    //     exit(1);
-                    // }
+                    if(val != key) {
+                        printf("read failed, Key %lu, val %llu\n",key, val);
+                        exit(1);
+                    }
                 } else if (op == INSERT) {  // insert
                     index.insert(key, key);
                 }

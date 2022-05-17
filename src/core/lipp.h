@@ -267,8 +267,6 @@ public:
          // epoch memory reclaimation
         Node* node = root;
 
-        (guard->instance)->scheduleForDeletion(dfsvsdvd) ;
-
         //lock
         uint64_t version = node->readLockOrRestart(needRestart) ;
         if(needRestart || (node!=root)) {
@@ -543,7 +541,7 @@ private:
     Node* root;
     std::stack<Node*> pending_two;
 
-    std::allocator<Node> node_allocator;
+    static std::allocator<Node> node_allocator;
     Node* new_nodes(int n)
     {
         Node* p = node_allocator.allocate(n);
@@ -552,7 +550,7 @@ private:
         RT_ASSERT(p != NULL && p != (Node*)(-1));
         return p;
     }
-    void delete_nodes(Node* p, int n)
+    static void delete_nodes(Node* p, int n)
     {
         node_allocator.deallocate(p, n);
     }
@@ -562,26 +560,26 @@ private:
         node_allocator.deallocate(p, 1);
     }
 
-    std::allocator<Item> item_allocator;
+    static std::allocator<Item> item_allocator;
     Item* new_items(int n)
     {
         Item* p = item_allocator.allocate(n);
         RT_ASSERT(p != NULL && p != (Item*)(-1));
         return p;
     }
-    void delete_items(Item* p, int n)
+    static void delete_items(Item* p, int n)
     {
         item_allocator.deallocate(p, n);
     }
 
-    std::allocator<bitmap_t> bitmap_allocator;
+    static std::allocator<bitmap_t> bitmap_allocator;
     bitmap_t* new_bitmap(int n)
     {
         bitmap_t* p = bitmap_allocator.allocate(n);
         RT_ASSERT(p != NULL && p != (bitmap_t*)(-1));
         return p;
     }
-    void delete_bitmap(bitmap_t* p, int n)
+    static void delete_bitmap(bitmap_t* p, int n)
     {
         bitmap_allocator.deallocate(p, n);
     }
@@ -978,23 +976,14 @@ private:
         }
     }
 
-    void delete_all(void *vnode){
-        Node *node = (node*)vnode ;
+    static void delete_all(void *vnode){
+        Node *node = (Node *) vnode ;
 
         delete_items(node->items, node->num_items);
         const int bitmap_size = BITMAP_SIZE(node->num_items);
         delete_bitmap(node->none_bitmap, bitmap_size);
         delete_bitmap(node->child_bitmap, bitmap_size);
         delete_nodes(node, 1);
-    }
-
-    void delete_two(void*vnode){
-        Node *node = (node*)vnode ;
-        node->size = 2;
-        node->num_inserts = node->num_insert_to_data = 0;
-        node->none_bitmap[0] = 0xff;
-        node->child_bitmap[0] = 0;
-        pending_two.push(node);
     }
 
     void scan_and_destory_tree(Node* _root, T* keys, P* values, bool destory = true)
@@ -1014,9 +1003,9 @@ private:
             Node* node = s.top().second;
             const int SHOULD_END_POS = begin + node->size;
             s.pop();
-
+            uint64_t version;
             if(node != _root){
-                uint64_t version = node->readLockOrRestart(needRestart) ;
+                version = node->readLockOrRestart(needRestart) ;
                 if(needRestart) goto restart ;
             }
 
@@ -1035,23 +1024,17 @@ private:
             RT_ASSERT(SHOULD_END_POS == begin);
 
             if (destory) {
-                if (node->is_two) {
-                    RT_ASSERT(node->build_size == 2);
-                    RT_ASSERT(node->num_items == 8);
-                    ebr->scheduleForDeletion(std::make_pair((void *)node, delete_two)) ;
-                } else {
-                    ebr->scheduleForDeletion(std::make_pair((void *)node, delete_nodes)) ;
-                }
+                ebr->scheduleForDeletion(std::make_pair((void *)node, delete_all)) ;
             }
 
             if(node != _root){
-                node->readUnlockOrRestart(needRestart) ;
+                node->readUnlockOrRestart(version, needRestart) ;
                 if(needRestart) goto restart ;
             }
         }
     }
 
-    void adjust(Node* path, int path_size){
+    void adjust(Node** path, int path_size, const T& key){
         int restartCount = 0;
         restart:
         if (restartCount++)
@@ -1069,11 +1052,11 @@ private:
             const bool need_rebuild = node->fixed == 0 && node->size >= node->build_size * 4 && node->size >= 64 && num_insert_to_data * 10 >= num_inserts;
 
             if (!need_rebuild){
-                node->readUnlockOrRestart(needRestart) ;
+                node->readUnlockOrRestart(version, needRestart) ;
                 if(needRestart) goto restart ;
             }
             else {
-                node->upgradeToWriteLockOrRestart(needRestart) ;
+                node->upgradeToWriteLockOrRestart(version, needRestart) ;
                 if(needRestart) goto restart ;
 
                 const int ESIZE = node->size;
@@ -1211,7 +1194,7 @@ private:
             atomic_add(path[i]->num_insert_to_data, insert_to_data) ;
         }
 
-        adjust(path, path_size) ;
+        adjust(path, path_size, key) ;
 
         return path[0];
     }
